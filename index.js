@@ -6470,6 +6470,284 @@ async function sendNotification(title, content, description, config) {
   }
 }
 
+// ============================================================================
+// 订阅到期检查辅助函数
+// ============================================================================
+
+/**
+ * 将日期按指定周期单位和值向前推进
+ * @param {Date} date - 要修改的日期对象（会被直接修改）
+ * @param {number} periodValue - 周期值
+ * @param {string} periodUnit - 周期单位 ('day' | 'month' | 'year')
+ */
+function advanceDateByPeriod(date, periodValue, periodUnit) {
+  switch (periodUnit) {
+    case 'day':
+      date.setDate(date.getDate() + periodValue);
+      break;
+    case 'month':
+      date.setMonth(date.getMonth() + periodValue);
+      break;
+    case 'year':
+      date.setFullYear(date.getFullYear() + periodValue);
+      break;
+  }
+}
+
+/**
+ * 计算订阅的到期日期信息（包括农历和公历）
+ * @param {Object} subscription - 订阅对象
+ * @param {number} currentMidnight - 当前日期的午夜时间戳
+ * @param {string} timezone - 时区
+ * @returns {{ expiryDate: Date, expiryMidnight: number, daysDiff: number, lunar?: Object }}
+ */
+function calculateExpiryInfo(subscription, currentMidnight, timezone) {
+  const expiryDate = new Date(subscription.expiryDate);
+
+  if (subscription.useLunar) {
+    const lunar = lunarCalendar.solar2lunar(
+      expiryDate.getFullYear(),
+      expiryDate.getMonth() + 1,
+      expiryDate.getDate()
+    );
+    const solar = lunarBiz.lunar2solar(lunar);
+    const lunarDate = new Date(solar.year, solar.month - 1, solar.day);
+    const expiryMidnight = getTimezoneMidnightTimestamp(lunarDate, timezone);
+    const daysDiff = Math.round((expiryMidnight - currentMidnight) / MS_PER_DAY);
+
+    return { expiryDate, expiryMidnight, daysDiff, lunar };
+  }
+
+  const expiryMidnight = getTimezoneMidnightTimestamp(expiryDate, timezone);
+  const daysDiff = Math.round((expiryMidnight - currentMidnight) / MS_PER_DAY);
+
+  return { expiryDate, expiryMidnight, daysDiff, lunar: null };
+}
+
+/**
+ * 计算农历订阅的下一个到期日期
+ * @param {Object} lunar - 当前农历日期对象
+ * @param {Object} subscription - 订阅对象
+ * @param {number} currentMidnight - 当前午夜时间戳
+ * @param {string} timezone - 时区
+ * @returns {{ newExpiryDate: Date, newExpiryMidnight: number, daysDiff: number }}
+ */
+function calculateNextLunarExpiryDate(lunar, subscription, currentMidnight, timezone) {
+  let nextLunar = lunar;
+  let daysDiff;
+  let newExpiryDate;
+  let newExpiryMidnight;
+
+  do {
+    nextLunar = lunarBiz.addLunarPeriod(nextLunar, subscription.periodValue, subscription.periodUnit);
+    const solar = lunarBiz.lunar2solar(nextLunar);
+    newExpiryDate = new Date(solar.year, solar.month - 1, solar.day);
+    newExpiryMidnight = getTimezoneMidnightTimestamp(newExpiryDate, timezone);
+    daysDiff = Math.round((newExpiryMidnight - currentMidnight) / MS_PER_DAY);
+
+    console.log('[定时任务] 订阅 "' + subscription.name + '" 更新到期日期: ' + newExpiryDate.toISOString() + ', 农历转换后午夜时间: ' + new Date(newExpiryMidnight).toISOString() + ', 剩余天数: ' + daysDiff);
+  } while (daysDiff < 0);
+
+  return { newExpiryDate, newExpiryMidnight, daysDiff };
+}
+
+/**
+ * 计算公历订阅的下一个到期日期
+ * @param {Date} expiryDate - 当前到期日期
+ * @param {Object} subscription - 订阅对象
+ * @param {number} currentMidnight - 当前午夜时间戳
+ * @param {string} timezone - 时区
+ * @returns {{ newExpiryDate: Date, newExpiryMidnight: number, daysDiff: number }}
+ */
+function calculateNextGregorianExpiryDate(expiryDate, subscription, currentMidnight, timezone) {
+  const newExpiryDate = new Date(expiryDate);
+  advanceDateByPeriod(newExpiryDate, subscription.periodValue, subscription.periodUnit);
+
+  let newExpiryMidnight = getTimezoneMidnightTimestamp(newExpiryDate, timezone);
+
+  while (newExpiryMidnight < currentMidnight) {
+    console.log('[定时任务] 新计算的到期日期 ' + newExpiryDate.toISOString() + ' (时区转换后午夜: ' + new Date(newExpiryMidnight).toISOString() + ') 仍然过期，继续计算下一个周期');
+    advanceDateByPeriod(newExpiryDate, subscription.periodValue, subscription.periodUnit);
+    newExpiryMidnight = getTimezoneMidnightTimestamp(newExpiryDate, timezone);
+  }
+
+  const daysDiff = Math.round((newExpiryMidnight - currentMidnight) / MS_PER_DAY);
+  return { newExpiryDate, newExpiryMidnight, daysDiff };
+}
+
+/**
+ * 创建自动续订的支付记录
+ * @param {Object} subscription - 订阅对象
+ * @param {Date} oldExpiryDate - 原到期日期
+ * @param {Date} newExpiryDate - 新到期日期
+ * @param {Date} currentTime - 当前时间
+ * @returns {Object} 支付记录
+ */
+function createAutoRenewalPaymentRecord(subscription, oldExpiryDate, newExpiryDate, currentTime) {
+  return {
+    id: Date.now().toString() + '_' + Math.random().toString(36).substr(2, 9),
+    date: currentTime.toISOString(),
+    amount: subscription.amount || 0,
+    type: 'auto',
+    note: '自动续订',
+    periodStart: oldExpiryDate.toISOString(),
+    periodEnd: newExpiryDate.toISOString()
+  };
+}
+
+/**
+ * 创建续订后的订阅对象
+ * @param {Object} subscription - 原订阅对象
+ * @param {Date} newExpiryDate - 新到期日期
+ * @param {Date} currentTime - 当前时间
+ * @param {Object} paymentRecord - 支付记录
+ * @returns {Object} 更新后的订阅对象
+ */
+function createRenewedSubscription(subscription, newExpiryDate, currentTime, paymentRecord) {
+  const paymentHistory = subscription.paymentHistory || [];
+  paymentHistory.push(paymentRecord);
+
+  return {
+    ...subscription,
+    expiryDate: newExpiryDate.toISOString(),
+    lastPaymentDate: currentTime.toISOString(),
+    paymentHistory
+  };
+}
+
+/**
+ * 检查订阅是否需要自动续订
+ * @param {Object} subscription - 订阅对象
+ * @param {number} daysDiff - 距离到期的天数
+ * @returns {boolean}
+ */
+function shouldAutoRenew(subscription, daysDiff) {
+  return daysDiff < 0 &&
+         subscription.periodValue &&
+         subscription.periodUnit &&
+         subscription.autoRenew !== false;
+}
+
+/**
+ * 解析通知时间配置
+ * @param {Object} config - 配置对象
+ * @param {string} timezone - 时区
+ * @param {Date} currentTime - 当前时间
+ * @returns {{ shouldNotifyThisHour: boolean, currentHour: string }}
+ */
+function parseNotificationHours(config, timezone, currentTime) {
+  const rawNotificationHours = Array.isArray(config.NOTIFICATION_HOURS) ? config.NOTIFICATION_HOURS : [];
+  const normalizedNotificationHours = rawNotificationHours
+    .map(value => String(value).trim())
+    .filter(value => value.length > 0)
+    .map(value => value === '*' ? '*' : value.toUpperCase() === 'ALL' ? 'ALL' : value.padStart(2, '0'));
+
+  const allowAllHours = normalizedNotificationHours.includes('*') || normalizedNotificationHours.includes('ALL');
+  const hourFormatter = new Intl.DateTimeFormat('en-US', { timeZone: timezone, hour12: false, hour: '2-digit' });
+  const currentHour = hourFormatter.format(currentTime);
+  const shouldNotifyThisHour = allowAllHours || normalizedNotificationHours.length === 0 || normalizedNotificationHours.includes(currentHour);
+
+  return { shouldNotifyThisHour, currentHour };
+}
+
+/**
+ * 处理单个订阅的到期检查和自动续订
+ * @param {Object} subscription - 订阅对象
+ * @param {Date} currentTime - 当前时间
+ * @param {number} currentMidnight - 当前午夜时间戳
+ * @param {string} timezone - 时区
+ * @returns {{ updatedSubscription: Object|null, expiringInfo: Object|null }}
+ */
+function processSubscription(subscription, currentTime, currentMidnight, timezone) {
+  const reminderSetting = resolveReminderSetting(subscription);
+  const expiryInfo = calculateExpiryInfo(subscription, currentMidnight, timezone);
+  let { expiryDate, daysDiff, lunar } = expiryInfo;
+
+  // 计算时间差
+  let diffMs = expiryDate.getTime() - currentTime.getTime();
+  let diffHours = diffMs / MS_PER_HOUR;
+
+  // 日志记录
+  const calendarType = subscription.useLunar ? '农历转换后' : '时区';
+  console.log('[定时任务] 订阅 "' + subscription.name + '" 到期日期: ' + expiryDate.toISOString() +
+    ', ' + calendarType + '午夜时间: ' + new Date(expiryInfo.expiryMidnight).toISOString() +
+    ', 剩余天数: ' + daysDiff);
+
+  // 检查是否需要自动续订
+  if (shouldAutoRenew(subscription, daysDiff)) {
+    let newExpiryDate, newDaysDiff;
+
+    if (subscription.useLunar) {
+      const result = calculateNextLunarExpiryDate(lunar, subscription, currentMidnight, timezone);
+      newExpiryDate = result.newExpiryDate;
+      newDaysDiff = result.daysDiff;
+    } else {
+      const result = calculateNextGregorianExpiryDate(expiryDate, subscription, currentMidnight, timezone);
+      newExpiryDate = result.newExpiryDate;
+      newDaysDiff = result.daysDiff;
+      console.log('[定时任务] 订阅 "' + subscription.name + '" 更新到期日期: ' + newExpiryDate.toISOString());
+    }
+
+    // 更新时间差
+    diffMs = newExpiryDate.getTime() - currentTime.getTime();
+    diffHours = diffMs / MS_PER_HOUR;
+
+    // 创建支付记录和更新后的订阅
+    const paymentRecord = createAutoRenewalPaymentRecord(subscription, expiryDate, newExpiryDate, currentTime);
+    const updatedSubscription = createRenewedSubscription(subscription, newExpiryDate, currentTime, paymentRecord);
+
+    // 检查续订后是否需要发送提醒
+    const shouldRemindAfterRenewal = shouldTriggerReminder(reminderSetting, newDaysDiff, diffHours);
+    let expiringInfo = null;
+
+    if (shouldRemindAfterRenewal) {
+      console.log('[定时任务] 订阅 "' + subscription.name + '" 在提醒范围内，将发送通知');
+      expiringInfo = {
+        ...updatedSubscription,
+        daysRemaining: newDaysDiff,
+        hoursRemaining: Math.round(diffHours)
+      };
+    }
+
+    return { updatedSubscription, expiringInfo };
+  }
+
+  // 未续订的情况：检查是否需要发送提醒
+  diffMs = new Date(subscription.expiryDate).getTime() - currentTime.getTime();
+  diffHours = diffMs / MS_PER_HOUR;
+  const shouldRemind = shouldTriggerReminder(reminderSetting, daysDiff, diffHours);
+
+  if (daysDiff < 0 && subscription.autoRenew === false) {
+    console.log('[定时任务] 订阅 "' + subscription.name + '" 已过期且未启用自动续订，将发送过期通知');
+    return {
+      updatedSubscription: null,
+      expiringInfo: {
+        ...subscription,
+        daysRemaining: daysDiff,
+        hoursRemaining: Math.round(diffHours)
+      }
+    };
+  }
+
+  if (shouldRemind) {
+    console.log('[定时任务] 订阅 "' + subscription.name + '" 在提醒范围内，将发送通知');
+    return {
+      updatedSubscription: null,
+      expiringInfo: {
+        ...subscription,
+        daysRemaining: daysDiff,
+        hoursRemaining: Math.round(diffHours)
+      }
+    };
+  }
+
+  return { updatedSubscription: null, expiringInfo: null };
+}
+
+// ============================================================================
+// 主函数：检查即将到期的订阅
+// ============================================================================
+
 // 4. 修改定时任务 checkExpiringSubscriptions，支持农历周期自动续订和农历提醒
 async function checkExpiringSubscriptions(env) {
   try {
@@ -6478,197 +6756,39 @@ async function checkExpiringSubscriptions(env) {
     const currentTime = getCurrentTimeInTimezone(timezone);
     console.log('[定时任务] 开始检查即将到期的订阅 UTC: ' + new Date().toISOString() + ', ' + timezone + ': ' + currentTime.toLocaleString('zh-CN', {timeZone: timezone}));
 
-    const currentMidnight = getTimezoneMidnightTimestamp(currentTime, timezone); // 统一计算当天的零点时间，避免多次格式化
-
-    const rawNotificationHours = Array.isArray(config.NOTIFICATION_HOURS) ? config.NOTIFICATION_HOURS : [];
-    const normalizedNotificationHours = rawNotificationHours
-      .map(value => String(value).trim())
-      .filter(value => value.length > 0)
-      .map(value => value === '*' ? '*' : value.toUpperCase() === 'ALL' ? 'ALL' : value.padStart(2, '0'));
-    const allowAllHours = normalizedNotificationHours.includes('*') || normalizedNotificationHours.includes('ALL');
-    const hourFormatter = new Intl.DateTimeFormat('en-US', { timeZone: timezone, hour12: false, hour: '2-digit' });
-    const currentHour = hourFormatter.format(currentTime);
-    const shouldNotifyThisHour = allowAllHours || normalizedNotificationHours.length === 0 || normalizedNotificationHours.includes(currentHour);
+    const currentMidnight = getTimezoneMidnightTimestamp(currentTime, timezone);
+    const { shouldNotifyThisHour, currentHour } = parseNotificationHours(config, timezone, currentTime);
 
     const subscriptions = await getAllSubscriptions(env);
     console.log('[定时任务] 共找到 ' + subscriptions.length + ' 个订阅');
+
     const expiringSubscriptions = [];
     const updatedSubscriptions = [];
-    let hasUpdates = false;
 
-for (const subscription of subscriptions) {
-  if (subscription.isActive === false) {
-    console.log('[定时任务] 订阅 "' + subscription.name + '" 已停用，跳过');
-    continue;
-  }
-
-  const reminderSetting = resolveReminderSetting(subscription);
-  let diffMs = 0;
-  let diffHours = 0;
-  let daysDiff;
-  if (subscription.useLunar) {
-    const expiryDate = new Date(subscription.expiryDate);
-    let lunar = lunarCalendar.solar2lunar(
-      expiryDate.getFullYear(),
-      expiryDate.getMonth() + 1,
-      expiryDate.getDate()
-    );
-    const solar = lunarBiz.lunar2solar(lunar);
-    const lunarDate = new Date(solar.year, solar.month - 1, solar.day);
-    const lunarMidnight = getTimezoneMidnightTimestamp(lunarDate, timezone);
-    
-    daysDiff = Math.round((lunarMidnight - currentMidnight) / MS_PER_DAY);
-
-    console.log('[定时任务] 订阅 "' + subscription.name + '" 到期日期: ' + expiryDate.toISOString() + ', 农历转换后午夜时间: ' + new Date(lunarMidnight).toISOString() + ', 剩余天数: ' + daysDiff);
-
-    diffMs = expiryDate.getTime() - currentTime.getTime();
-    diffHours = diffMs / MS_PER_HOUR;
-
-    if (daysDiff < 0 && subscription.periodValue && subscription.periodUnit && subscription.autoRenew !== false) {
-      let nextLunar = lunar;
-      do {
-        nextLunar = lunarBiz.addLunarPeriod(nextLunar, subscription.periodValue, subscription.periodUnit);
-        const solar = lunarBiz.lunar2solar(nextLunar);
-        var newExpiryDate = new Date(solar.year, solar.month - 1, solar.day);
-        const newLunarMidnight = getTimezoneMidnightTimestamp(newExpiryDate, timezone);
-        daysDiff = Math.round((newLunarMidnight - currentMidnight) / MS_PER_DAY);
-        console.log('[定时任务] 订阅 "' + subscription.name + '" 更新到期日期: ' + newExpiryDate.toISOString() + ', 农历转换后午夜时间: ' + new Date(newLunarMidnight).toISOString() + ', 剩余天数: ' + daysDiff);
-      } while (daysDiff < 0);
-
-      diffMs = newExpiryDate.getTime() - currentTime.getTime();
-      diffHours = diffMs / MS_PER_HOUR;
-
-      const paymentRecord = {
-        id: Date.now().toString() + '_' + Math.random().toString(36).substr(2, 9),
-        date: currentTime.toISOString(),
-        amount: subscription.amount || 0,
-        type: 'auto',
-        note: '自动续订',
-        periodStart: expiryDate.toISOString(),
-        periodEnd: newExpiryDate.toISOString()
-      };
-
-      const paymentHistory = subscription.paymentHistory || [];
-      paymentHistory.push(paymentRecord);
-
-      const updatedSubscription = {
-        ...subscription,
-        expiryDate: newExpiryDate.toISOString(),
-        lastPaymentDate: currentTime.toISOString(),
-        paymentHistory
-      };
-      updatedSubscriptions.push(updatedSubscription);
-      hasUpdates = true;
-
-      const shouldRemindAfterRenewal = shouldTriggerReminder(reminderSetting, daysDiff, diffHours);
-      if (shouldRemindAfterRenewal) {
-        console.log('[定时任务] 订阅 "' + subscription.name + '" 在提醒范围内，将发送通知');
-        expiringSubscriptions.push({
-          ...updatedSubscription,
-          daysRemaining: daysDiff,
-          hoursRemaining: Math.round(diffHours)
-        });
+    // 处理每个订阅
+    for (const subscription of subscriptions) {
+      if (subscription.isActive === false) {
+        console.log('[定时任务] 订阅 "' + subscription.name + '" 已停用，跳过');
+        continue;
       }
-      continue;
+
+      const { updatedSubscription, expiringInfo } = processSubscription(
+        subscription,
+        currentTime,
+        currentMidnight,
+        timezone
+      );
+
+      if (updatedSubscription) {
+        updatedSubscriptions.push(updatedSubscription);
+      }
+      if (expiringInfo) {
+        expiringSubscriptions.push(expiringInfo);
+      }
     }
-  } else {
-    const expiryDate = new Date(subscription.expiryDate);
-    const expiryMidnight = getTimezoneMidnightTimestamp(expiryDate, timezone);
 
-    daysDiff = Math.round((expiryMidnight - currentMidnight) / MS_PER_DAY);
-
-    console.log('[定时任务] 订阅 "' + subscription.name + '" 到期日期: ' + expiryDate.toISOString() + ', 时区午夜时间: ' + new Date(expiryMidnight).toISOString() + ', 剩余天数: ' + daysDiff);
-
-    diffMs = expiryDate.getTime() - currentTime.getTime();
-    diffHours = diffMs / MS_PER_HOUR;
-
-    if (daysDiff < 0 && subscription.periodValue && subscription.periodUnit && subscription.autoRenew !== false) {
-      const newExpiryDate = new Date(expiryDate);
-
-      if (subscription.periodUnit === 'day') {
-        newExpiryDate.setDate(expiryDate.getDate() + subscription.periodValue);
-      } else if (subscription.periodUnit === 'month') {
-        newExpiryDate.setMonth(expiryDate.getMonth() + subscription.periodValue);
-      } else if (subscription.periodUnit === 'year') {
-        newExpiryDate.setFullYear(expiryDate.getFullYear() + subscription.periodValue);
-      }
-
-      let newExpiryMidnight = getTimezoneMidnightTimestamp(newExpiryDate, timezone);
-      while (newExpiryMidnight < currentMidnight) {
-        console.log('[定时任务] 新计算的到期日期 ' + newExpiryDate.toISOString() + ' (时区转换后午夜: ' + new Date(newExpiryMidnight).toISOString() + ') 仍然过期，继续计算下一个周期');
-        if (subscription.periodUnit === 'day') {
-          newExpiryDate.setDate(newExpiryDate.getDate() + subscription.periodValue);
-        } else if (subscription.periodUnit === 'month') {
-          newExpiryDate.setMonth(newExpiryDate.getMonth() + subscription.periodValue);
-        } else if (subscription.periodUnit === 'year') {
-          newExpiryDate.setFullYear(newExpiryDate.getFullYear() + subscription.periodValue);
-        }
-        newExpiryMidnight = getTimezoneMidnightTimestamp(newExpiryDate, timezone);
-      }
-
-      console.log('[定时任务] 订阅 "' + subscription.name + '" 更新到期日期: ' + newExpiryDate.toISOString());
-
-      diffMs = newExpiryDate.getTime() - currentTime.getTime();
-      diffHours = diffMs / MS_PER_HOUR;
-
-      const paymentRecord = {
-        id: Date.now().toString() + '_' + Math.random().toString(36).substr(2, 9),
-        date: currentTime.toISOString(),
-        amount: subscription.amount || 0,
-        type: 'auto',
-        note: '自动续订',
-        periodStart: expiryDate.toISOString(),
-        periodEnd: newExpiryDate.toISOString()
-      };
-
-      const paymentHistory = subscription.paymentHistory || [];
-      paymentHistory.push(paymentRecord);
-
-      const updatedSubscription = {
-        ...subscription,
-        expiryDate: newExpiryDate.toISOString(),
-        lastPaymentDate: currentTime.toISOString(),
-        paymentHistory
-      };
-      updatedSubscriptions.push(updatedSubscription);
-      hasUpdates = true;
-
-      const newDaysDiff = Math.round((newExpiryMidnight - currentMidnight) / MS_PER_DAY);
-      const shouldRemindAfterRenewal = shouldTriggerReminder(reminderSetting, newDaysDiff, diffHours);
-      if (shouldRemindAfterRenewal) {
-        console.log('[定时任务] 订阅 "' + subscription.name + '" 在提醒范围内，将发送通知');
-        expiringSubscriptions.push({
-          ...updatedSubscription,
-          daysRemaining: newDaysDiff,
-          hoursRemaining: Math.round(diffHours)
-        });
-      }
-      continue;
-    }
-  }
-
-  diffMs = new Date(subscription.expiryDate).getTime() - currentTime.getTime();
-  diffHours = diffMs / MS_PER_HOUR;
-  const shouldRemind = shouldTriggerReminder(reminderSetting, daysDiff, diffHours);
-
-  if (daysDiff < 0 && subscription.autoRenew === false) {
-    console.log('[定时任务] 订阅 "' + subscription.name + '" 已过期且未启用自动续订，将发送过期通知');
-    expiringSubscriptions.push({
-      ...subscription,
-      daysRemaining: daysDiff,
-      hoursRemaining: Math.round(diffHours)
-    });
-  } else if (shouldRemind) {
-    console.log('[定时任务] 订阅 "' + subscription.name + '" 在提醒范围内，将发送通知');
-    expiringSubscriptions.push({
-      ...subscription,
-      daysRemaining: daysDiff,
-      hoursRemaining: Math.round(diffHours)
-    });
-  }
-}
-
-    if (hasUpdates) {
+    // 保存更新后的订阅
+    if (updatedSubscriptions.length > 0) {
       const mergedSubscriptions = subscriptions.map(sub => {
         const updated = updatedSubscriptions.find(u => u.id === sub.id);
         return updated || sub;
@@ -6676,15 +6796,13 @@ for (const subscription of subscriptions) {
       await env.SUBSCRIPTIONS_KV.put('subscriptions', JSON.stringify(mergedSubscriptions));
     }
 
+    // 发送通知
     if (expiringSubscriptions.length > 0) {
       if (!shouldNotifyThisHour) {
         console.log('[定时任务] 当前小时 ' + currentHour + ' 未配置为推送时间，跳过发送通知');
-        expiringSubscriptions.length = 0;
       } else {
-        // 按到期时间排序
         expiringSubscriptions.sort((a, b) => a.daysRemaining - b.daysRemaining);
 
-        // 使用优化的格式化函数
         const commonContent = formatNotificationContent(expiringSubscriptions, config);
         const metadataTags = extractTagsFromSubscriptions(expiringSubscriptions);
 
